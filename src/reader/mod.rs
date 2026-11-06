@@ -568,7 +568,7 @@ mod ns_reader;
 mod slice_reader;
 mod state;
 
-pub use ns_reader::NsReader;
+pub use ns_reader::{NsReader, ReaderBuffers};
 
 /// Range of input in bytes, that corresponds to some piece of XML
 pub type Span = Range<u64>;
@@ -811,6 +811,19 @@ impl<R> Reader<R> {
             reader,
             state: ReaderState::default(),
         }
+    }
+
+    /// photo-gallery: [`Self::from_reader`] in kept buffers, see [`NsReader::from_str_with`].
+    pub(crate) fn from_reader_with(reader: R, opened_buffer: String, opened_starts: Vec<usize>) -> Self {
+        Self {
+            reader,
+            state: ReaderState::with_buffers(opened_buffer, opened_starts),
+        }
+    }
+
+    /// photo-gallery: the buffers back, see [`NsReader::into_buffers`].
+    pub(crate) fn into_buffers(self) -> (String, Vec<usize>) {
+        self.state.into_buffers()
     }
 
     /// Returns reference to the parser configuration
@@ -2086,7 +2099,7 @@ mod test {
 
             /// Ensures, that no empty `Text` events are generated
             mod $read_event {
-                use crate::events::{BytesCData, BytesComment, BytesDecl, BytesEnd, BytesPI, BytesStart, BytesText, Event};
+                use crate::events::{BytesCData, BytesDecl, BytesEnd, BytesPI, BytesStart, BytesText, Event};
                 use crate::reader::Reader;
                 use pretty_assertions::assert_eq;
 
@@ -2212,7 +2225,7 @@ mod test {
 
                     assert_eq!(
                         reader.$read_event($buf) $(.$await)? .unwrap(),
-                        Event::Comment(BytesComment::new("").unwrap())
+                        Event::Comment(BytesText::from_escaped(""))
                     );
                 }
 

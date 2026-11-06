@@ -80,8 +80,6 @@ use attributes::{AttrError, Attribute, Attributes};
 /// assert_eq!(reader.read_event().unwrap(), Event::Empty(event.borrow()));
 /// assert_eq!(reader.read_event().unwrap(), Event::Start(event.borrow()));
 /// // deref coercion of &BytesStart to &str
-/// assert_eq!(&event as &str, content);
-/// // AsRef<str> for &T
 /// assert_eq!(event.as_ref(), content);
 /// ```
 ///
@@ -97,7 +95,7 @@ use attributes::{AttrError, Attribute, Attributes};
 /// [`local_name`]: Self::local_name
 /// [`attributes`]: Self::attributes
 /// [`.into_owned()`]: Self::into_owned
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, Hash, PartialEq, PartialOrd, Ord)]
 pub struct BytesStart<'i> {
     /// content of the element
     pub(crate) buf: Cow<'i, str>,
@@ -305,16 +303,8 @@ impl<'i> BytesStart<'i> {
         let s = self.buf.to_mut();
         s.push_str(attr.key.as_ref());
         s.push_str("=\"");
-        // The value is already escaped, but if it was read from a single-quoted
-        // or unquoted attribute it may contain `"`, which would end the value here
-        let mut parts = attr.value.split('"');
-        if let Some(first) = parts.next() {
-            s.push_str(first);
-        }
-        for part in parts {
-            s.push_str("&quot;");
-            s.push_str(part);
-        }
+        // FIXME: need to escape attribute content
+        s.push_str(&attr.value);
         s.push('"');
     }
 
@@ -395,8 +385,6 @@ impl<'i> arbitrary::Arbitrary<'i> for BytesStart<'i> {
 /// assert_eq!(reader.read_event().unwrap(), Event::End(event.borrow()));
 /// assert_eq!(event.name().as_ref(), content);
 /// // deref coercion of &BytesEnd to &str
-/// assert_eq!(&event as &str, content);
-/// // AsRef<str> for &T
 /// assert_eq!(event.as_ref(), content);
 /// ```
 ///
@@ -411,7 +399,7 @@ impl<'i> arbitrary::Arbitrary<'i> for BytesStart<'i> {
 /// [`name`]: Self::name
 /// [`local_name`]: Self::local_name
 /// [`.into_owned()`]: Self::into_owned
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, Hash, PartialEq, PartialOrd, Ord)]
 pub struct BytesEnd<'i> {
     name: Cow<'i, str>,
 }
@@ -508,9 +496,11 @@ impl<'i> arbitrary::Arbitrary<'i> for BytesEnd<'i> {
 /// Data from various events (most notably, `Event::Text`).
 ///
 /// This event implements `Deref<Target = str>`. The `deref()` implementation
-/// returns the content of this event. In case of DTD this is everything between
-/// `<!DOCTYPE` + spaces and closing `>` (i.e. in case of DTD the first character
-/// is never space):
+/// returns the content of this event. In case of comment this is everything
+/// between `<!--` and `-->` and the text of comment may not contain `-->` inside
+/// (if [`Config::check_comments`] is set to `true`).
+/// In case of DTD this is everything between `<!DOCTYPE` + spaces and closing `>`
+/// (i.e. in case of DTD the first character is never space):
 ///
 /// ```
 /// # use quick_xml::events::{BytesText, Event};
@@ -519,17 +509,17 @@ impl<'i> arbitrary::Arbitrary<'i> for BytesEnd<'i> {
 /// // Remember, that \ at the end of string literal strips
 /// // all space characters to the first non-space character
 /// let mut reader = Reader::from_str("\
-///     <!DOCTYPE  text >\
-///     text "
+///     <!DOCTYPE comment or text >\
+///     comment or text \
+///     <!--comment or text -->"
 /// );
-/// let content = "text ";
+/// let content = "comment or text ";
 /// let event = BytesText::new(content);
 ///
 /// assert_eq!(reader.read_event().unwrap(), Event::DocType(event.borrow()));
 /// assert_eq!(reader.read_event().unwrap(), Event::Text(event.borrow()));
+/// assert_eq!(reader.read_event().unwrap(), Event::Comment(event.borrow()));
 /// // deref coercion of &BytesText to &str
-/// assert_eq!(&event as &str, content);
-/// // AsRef<str> for &T
 /// assert_eq!(event.as_ref(), content);
 /// ```
 ///
@@ -541,6 +531,7 @@ impl<'i> arbitrary::Arbitrary<'i> for BytesEnd<'i> {
 /// If such event need to outlive the single parsing loop iteration, take ownership of the data
 /// using [`.into_owned()`].
 ///
+/// [`Config::check_comments`]: crate::reader::Config::check_comments
 /// [`.into_owned()`]: Self::into_owned
 #[derive(Clone, Eq, Hash, PartialEq, PartialOrd, Ord)]
 pub struct BytesText<'i> {
@@ -752,8 +743,6 @@ impl<'i> arbitrary::Arbitrary<'i> for BytesText<'i> {
 ///
 /// assert_eq!(reader.read_event().unwrap(), Event::CData(event.borrow()));
 /// // deref coercion of &BytesCData to &str
-/// assert_eq!(&event as &str, content);
-/// // AsRef<str> for &T
 /// assert_eq!(event.as_ref(), content);
 /// ```
 ///
@@ -900,11 +889,10 @@ impl<'i> BytesCData<'i> {
     ///
     /// This function performs following replacements:
     ///
-    /// | Character      | Replacement
-    /// |----------------|------------
-    /// | `<`            | `&lt;`
-    /// | `>` after `]]` | `&gt;`
-    /// | `&`            | `&amp;`
+    /// | Character | Replacement
+    /// |-----------|------------
+    /// | `<`       | `&lt;`
+    /// | `&`       | `&amp;`
     ///
     /// [specification]: https://www.w3.org/TR/xml11/#syntax
     pub fn minimal_escape(self) -> Result<BytesText<'i>, EncodingError> {
@@ -1025,179 +1013,6 @@ impl FusedIterator for CDataIterator<'_> {}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-/// A data between `<!--` and `-->` of an XML comment.
-///
-/// This event implements `Deref<Target = str>`. The `deref()` implementation
-/// returns the content of this event. This is everything between `<!--` and `-->`
-/// and the text of comment may not contain `--` inside (when [`Config::check_comments`] is set to `true`).
-///
-/// ```
-/// # use quick_xml::events::{BytesComment, Event};
-/// # use quick_xml::reader::Reader;
-/// # use pretty_assertions::assert_eq;
-/// let mut reader = Reader::from_str("<!--comment -- -->");
-/// let content = "comment -- ";
-/// let event = BytesComment::new(content).unwrap();
-///
-/// assert_eq!(reader.read_event().unwrap(), Event::Comment(event.borrow()));
-/// // deref coercion of &BytesComment to &str
-/// assert_eq!(&event as &str, content);
-/// // AsRef<str> for &T
-/// assert_eq!(event.as_ref(), content);
-/// ```
-///
-/// # Lifetime
-///
-/// `'i` (stands of "input") is a lifetime of the original buffer from which event was parsed.
-/// In particular, when reader was created from a string, this is lifetime of the string.
-/// If event come from a buffered reader, this is lifetime of the user-provided buffer.
-/// If such event need to outlive the single parsing loop iteration, take ownership of the data
-/// using [`.into_owned()`].
-///
-/// [`Config::check_comments`]: crate::reader::Config::check_comments
-/// [`.into_owned()`]: Self::into_owned
-#[derive(Clone, Eq, Hash, PartialEq, PartialOrd, Ord)]
-pub struct BytesComment<'i> {
-    content: BytesText<'i>,
-}
-
-impl<'i> BytesComment<'i> {
-    /// Creates a new `BytesComment` from a string as it appeared in the XML source.
-    #[inline]
-    pub(crate) const fn wrap(content: &'i str) -> Self {
-        Self {
-            content: BytesText::wrap(content),
-        }
-    }
-
-    /// Creates a new comment from a string. Returns error if `content` contains the `-->` sequence,
-    /// with the position of `-->`.
-    ///
-    /// ```
-    /// # use quick_xml::events::BytesComment;
-    /// #
-    /// assert!(BytesComment::new("--").is_ok());
-    /// assert!(matches!(BytesComment::new("illegal -->"), Err(8)));
-    /// ```
-    #[inline]
-    pub fn new(content: &'i str) -> Result<Self, usize> {
-        match content.find("-->") {
-            Some(p) => Err(p),
-            None => Ok(Self::wrap(content)),
-        }
-    }
-
-    /// Ensures that all data is owned to extend the object's lifetime if necessary.
-    #[inline]
-    pub fn into_owned(self) -> BytesComment<'static> {
-        BytesComment {
-            content: self.content.into_owned(),
-        }
-    }
-
-    /// Extracts the inner `Cow` from the `BytesComment` event container.
-    #[inline]
-    pub fn into_inner(self) -> Cow<'i, str> {
-        self.content.into_inner()
-    }
-
-    /// Converts the event into a borrowed event.
-    #[inline]
-    pub fn borrow(&self) -> BytesComment<'_> {
-        BytesComment {
-            content: self.content.borrow(),
-        }
-    }
-
-    /// Returns the content of the XML 1.0 or HTML event with EOL normalization applied.
-    ///
-    /// This will allocate if EOL normalization is required.
-    ///
-    /// Note, that this method should be used only if event represents XML 1.0 or HTML content,
-    /// because rules for normalizing EOLs for [XML 1.0] / [HTML] and [XML 1.1] differs.
-    ///
-    /// This method also can be used to get HTML content, because rules the same.
-    ///
-    /// [XML 1.0]: https://www.w3.org/TR/xml/#sec-line-ends
-    /// [XML 1.1]: https://www.w3.org/TR/xml11/#sec-line-ends
-    /// [HTML]: https://html.spec.whatwg.org/#normalize-newlines
-    #[inline]
-    pub fn xml10_content(&self) -> Cow<'i, str> {
-        self.content.xml10_content()
-    }
-
-    /// Returns the content of the XML 1.1 event with EOL normalization applied.
-    ///
-    /// This will allocate if EOL normalization is required.
-    ///
-    /// Note, that this method should be used only if event represents XML 1.1 content,
-    /// because rules for normalizing EOLs for [XML 1.0], [XML 1.1] and [HTML] differs.
-    ///
-    /// To get HTML content use [`xml10_content()`](Self::xml10_content).
-    ///
-    /// [XML 1.0]: https://www.w3.org/TR/xml/#sec-line-ends
-    /// [XML 1.1]: https://www.w3.org/TR/xml11/#sec-line-ends
-    /// [HTML]: https://html.spec.whatwg.org/#normalize-newlines
-    #[inline]
-    pub fn xml11_content(&self) -> Cow<'i, str> {
-        self.content.xml11_content()
-    }
-
-    /// Returns the content of the XML event with EOL normalization applied
-    /// according to the specified version.
-    ///
-    /// This will allocate if EOL normalization is required.
-    #[inline]
-    pub fn xml_content(&self, version: XmlVersion) -> Cow<'i, str> {
-        self.content.xml_content(version)
-    }
-
-    /// Alias for [`xml10_content()`](Self::xml10_content).
-    #[inline]
-    pub fn html_content(&self) -> Cow<'i, str> {
-        self.content.html_content()
-    }
-}
-
-impl<'i> Debug for BytesComment<'i> {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "BytesComment {{ content: ")?;
-        write_cow_string(f, &self.content.content)?;
-        write!(f, " }}")
-    }
-}
-
-impl<'i> Deref for BytesComment<'i> {
-    type Target = str;
-
-    fn deref(&self) -> &str {
-        &self.content
-    }
-}
-
-impl AsRef<str> for BytesComment<'_> {
-    fn as_ref(&self) -> &str {
-        self
-    }
-}
-
-#[cfg(feature = "arbitrary")]
-impl<'i> arbitrary::Arbitrary<'i> for BytesComment<'i> {
-    fn arbitrary(u: &mut arbitrary::Unstructured<'i>) -> arbitrary::Result<Self> {
-        let s = <&str>::arbitrary(u)?;
-        if !s.chars().all(char::is_alphanumeric) {
-            return Err(arbitrary::Error::IncorrectFormat);
-        }
-        Self::new(s).map_err(|_| arbitrary::Error::IncorrectFormat)
-    }
-
-    fn size_hint(depth: usize) -> (usize, Option<usize>) {
-        <&str as arbitrary::Arbitrary>::size_hint(depth)
-    }
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
 /// [Processing instructions][PI] (PIs) allow documents to contain instructions for applications.
 ///
 /// This event implements `Deref<Target = str>`. The `deref()` implementation
@@ -1215,8 +1030,6 @@ impl<'i> arbitrary::Arbitrary<'i> for BytesComment<'i> {
 ///
 /// assert_eq!(reader.read_event().unwrap(), Event::PI(event.borrow()));
 /// // deref coercion of &BytesPI to &str
-/// assert_eq!(&event as &str, content);
-/// // AsRef<str> for &T
 /// assert_eq!(event.as_ref(), content);
 /// ```
 ///
@@ -1230,7 +1043,7 @@ impl<'i> arbitrary::Arbitrary<'i> for BytesComment<'i> {
 ///
 /// [PI]: https://www.w3.org/TR/xml11/#sec-pi
 /// [`.into_owned()`]: Self::into_owned
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, Hash, PartialEq, PartialOrd, Ord)]
 pub struct BytesPI<'i> {
     content: BytesStart<'i>,
 }
@@ -1403,8 +1216,6 @@ impl<'i> arbitrary::Arbitrary<'i> for BytesPI<'i> {
 ///
 /// assert_eq!(reader.read_event().unwrap(), Event::Decl(event.borrow()));
 /// // deref coercion of &BytesDecl to &str
-/// assert_eq!(&event as &str, content);
-/// // AsRef<str> for &T
 /// assert_eq!(event.as_ref(), content);
 /// ```
 ///
@@ -1417,7 +1228,7 @@ impl<'i> arbitrary::Arbitrary<'i> for BytesPI<'i> {
 /// using [`.into_owned()`].
 ///
 /// [`.into_owned()`]: Self::into_owned
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
 pub struct BytesDecl<'i> {
     content: BytesStart<'i>,
 }
@@ -1533,7 +1344,7 @@ impl<'i> BytesDecl<'i> {
                 ))))
             }
             // error parsing attributes
-            Some(Err(e)) => Err(Error::InvalidAttr(e)),
+            Some(Err(e)) => Err(e.into()),
             // no attributes
             None => Err(Error::IllFormed(IllFormedError::MissingDeclVersion(None))),
         }
@@ -1763,8 +1574,6 @@ impl<'i> arbitrary::Arbitrary<'i> for BytesDecl<'i> {
 ///
 /// assert_eq!(reader.read_event().unwrap(), Event::GeneralRef(event.borrow()));
 /// // deref coercion of &BytesRef to &str
-/// assert_eq!(&event as &str, content);
-/// // AsRef<str> for &T
 /// assert_eq!(event.as_ref(), content);
 /// ```
 ///
@@ -1777,7 +1586,7 @@ impl<'i> arbitrary::Arbitrary<'i> for BytesDecl<'i> {
 /// using [`.into_owned()`].
 ///
 /// [`.into_owned()`]: Self::into_owned
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, Hash, PartialEq, PartialOrd, Ord)]
 pub struct BytesRef<'i> {
     content: Cow<'i, str>,
 }
@@ -1968,7 +1777,7 @@ impl<'i> arbitrary::Arbitrary<'i> for BytesRef<'i> {
 ///
 /// [`Reader::read_event_into`]: crate::reader::Reader::read_event_into
 /// [`.into_owned()`]: Self::into_owned
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub enum Event<'i> {
     /// Start tag (with attributes) `<tag attr="value">`.
@@ -1982,7 +1791,7 @@ pub enum Event<'i> {
     /// Unescaped character data stored in `<![CDATA[...]]>`.
     CData(BytesCData<'i>),
     /// Comment `<!-- ... -->`.
-    Comment(BytesComment<'i>),
+    Comment(BytesText<'i>),
     /// XML declaration `<?xml ...?>`.
     Decl(BytesDecl<'i>),
     /// Processing instruction `<?...?>`.

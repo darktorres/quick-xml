@@ -131,7 +131,7 @@ impl<W> Writer<W> {
     }
 
     /// Creates a `Writer` with configured indents from a generic writer.
-    pub fn new_with_indent(inner: W, indent_char: char, indent_size: usize) -> Writer<W> {
+    pub fn new_with_indent(inner: W, indent_char: u8, indent_size: usize) -> Writer<W> {
         Writer {
             writer: inner,
             config: Config {
@@ -174,9 +174,11 @@ impl<W> Writer<W> {
     /// # Example
     ///
     /// ```
-    /// # fn main() -> std::io::Result<()> {
-    /// use quick_xml::events::BytesText;
+    /// # use quick_xml::Result;
+    /// # fn main() -> Result<()> {
+    /// use quick_xml::events::{BytesStart, BytesText, Event};
     /// use quick_xml::writer::Writer;
+    /// use quick_xml::Error;
     /// use std::io::Cursor;
     ///
     /// let mut writer = Writer::new(Cursor::new(Vec::new()));
@@ -227,13 +229,15 @@ impl<W: Write> Writer<W> {
     /// # Example
     ///
     /// ```rust
-    /// # use pretty_assertions::assert_eq;
-    /// # fn main() -> std::io::Result<()> {
+    /// # use quick_xml::Result;
+    /// # fn main() -> Result<()> {
+    /// use quick_xml::events::{BytesStart, BytesText, Event};
     /// use quick_xml::writer::Writer;
+    /// use quick_xml::Error;
     /// use std::io::Cursor;
     ///
     /// let mut buffer = Vec::new();
-    /// let mut writer = Writer::new_with_indent(&mut buffer, ' ', 4);
+    /// let mut writer = Writer::new_with_indent(&mut buffer, b' ', 4);
     ///
     /// writer.write_bom()?;
     /// writer
@@ -251,7 +255,7 @@ impl<W: Write> Writer<W> {
     /// ```
     /// [Byte-Order-Mark]: https://unicode.org/faq/utf_bom.html#BOM
     pub fn write_bom(&mut self) -> io::Result<()> {
-        self.writer.write_all(UTF8_BOM)
+        self.write(UTF8_BOM)
     }
 
     /// Writes the given event to the underlying writer.
@@ -282,14 +286,14 @@ impl<W: Write> Writer<W> {
             ),
             Event::Text(e) => {
                 next_should_line_break = false;
-                self.writer.write_all(e.as_bytes())
+                self.write(e.as_bytes())
             }
             Event::Comment(e) => self.write_wrapped("<!--", &e, "-->"),
             Event::CData(e) => {
                 next_should_line_break = false;
-                self.writer.write_all(b"<![CDATA[")?;
-                self.writer.write_all(e.as_bytes())?;
-                self.writer.write_all(b"]]>")
+                self.write(b"<![CDATA[")?;
+                self.write(e.as_bytes())?;
+                self.write(b"]]>")
             }
             Event::Decl(e) => self.write_wrapped("<?", &e, "?>"),
             Event::PI(e) => self.write_wrapped("<?", &e, "?>"),
@@ -303,6 +307,12 @@ impl<W: Write> Writer<W> {
         result
     }
 
+    /// Writes bytes
+    #[inline]
+    pub(crate) fn write(&mut self, value: &[u8]) -> io::Result<()> {
+        self.writer.write_all(value)
+    }
+
     #[inline]
     fn write_wrapped(&mut self, before: &str, value: &str, after: &str) -> io::Result<()> {
         if let Some(ref i) = self.indent {
@@ -311,9 +321,9 @@ impl<W: Write> Writer<W> {
                 self.writer.write_all(i.current().as_bytes())?;
             }
         }
-        self.writer.write_all(before.as_bytes())?;
-        self.writer.write_all(value.as_bytes())?;
-        self.writer.write_all(after.as_bytes())?;
+        self.write(before.as_bytes())?;
+        self.write(value.as_bytes())?;
+        self.write(after.as_bytes())?;
         Ok(())
     }
 
@@ -346,7 +356,8 @@ impl<W: Write> Writer<W> {
     /// # use serde::Serialize;
     /// # use quick_xml::events::{BytesStart, Event};
     /// # use quick_xml::writer::Writer;
-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # use quick_xml::se::SeError;
+    /// # fn main() -> Result<(), SeError> {
     /// #[derive(Debug, PartialEq, Serialize)]
     /// struct MyData {
     ///     question: String,
@@ -359,7 +370,7 @@ impl<W: Write> Writer<W> {
     /// };
     ///
     /// let mut buffer = Vec::new();
-    /// let mut writer = Writer::new_with_indent(&mut buffer, ' ', 4);
+    /// let mut writer = Writer::new_with_indent(&mut buffer, b' ', 4);
     ///
     /// let start = BytesStart::new("root");
     /// let end = start.to_end();
@@ -386,11 +397,11 @@ impl<W: Write> Writer<W> {
         tag_name: &str,
         content: &T,
     ) -> Result<(), SeError> {
-        use crate::se::{Indent, Serializer, Utf8Writer};
+        use crate::se::{Indent, Serializer};
 
         self.write_indent()?;
-        let mut writer = Utf8Writer(&mut self.writer);
-        let mut serializer = Serializer::with_root(&mut writer, Some(tag_name))?;
+        let mut fmt = ToFmtWrite(&mut self.writer);
+        let mut serializer = Serializer::with_root(&mut fmt, Some(tag_name))?;
 
         if let Some(indent) = &mut self.indent {
             serializer.set_indent(Indent::Borrow(indent));
@@ -482,7 +493,7 @@ impl<'a, W> ElementWriter<'a, W> {
     /// ```
     /// # use quick_xml::writer::Writer;
     /// let mut buffer = Vec::new();
-    /// let mut writer = Writer::new_with_indent(&mut buffer, ' ', 2);
+    /// let mut writer = Writer::new_with_indent(&mut buffer, b' ', 2);
     /// writer
     ///   .create_element("element")
     ///     //.new_line() (1)
@@ -643,6 +654,18 @@ impl<'a, W: Write> ElementWriter<'a, W> {
         Ok(self.writer)
     }
 }
+#[cfg(feature = "serialize")]
+pub(crate) struct ToFmtWrite<T>(pub T);
+
+#[cfg(feature = "serialize")]
+impl<T> std::fmt::Write for ToFmtWrite<T>
+where
+    T: std::io::Write,
+{
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        self.0.write_all(s.as_bytes()).map_err(|_| std::fmt::Error)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct Indentation {
@@ -655,12 +678,13 @@ pub(crate) struct Indentation {
     indent_size: usize,
     /// Used as a cache for the string used for indentation
     indents: String,
-    /// The current amount of indentation, in bytes of `indents`
+    /// The current amount of indentation
     current_indent_len: usize,
 }
 
 impl Indentation {
-    pub fn new(indent_char: char, indent_size: usize) -> Self {
+    pub fn new(indent_char: u8, indent_size: usize) -> Self {
+        let indent_char = char::from(indent_char);
         Self {
             should_line_break: false,
             indent_char,
@@ -670,21 +694,15 @@ impl Indentation {
         }
     }
 
-    /// Size of one indentation level in bytes
-    #[inline]
-    const fn level_len(&self) -> usize {
-        self.indent_size * self.indent_char.len_utf8()
-    }
-
     /// Increase indentation by one level
     pub fn grow(&mut self) {
-        self.current_indent_len += self.level_len();
+        self.current_indent_len += self.indent_size;
         self.ensure(self.current_indent_len);
     }
 
     /// Decrease indentation by one level. Do nothing, if level already zero
     pub fn shrink(&mut self) {
-        self.current_indent_len = self.current_indent_len.saturating_sub(self.level_len());
+        self.current_indent_len = self.current_indent_len.saturating_sub(self.indent_size);
     }
 
     /// Returns indent string for current level
@@ -693,10 +711,8 @@ impl Indentation {
     }
 
     /// Returns indent with current indent plus additional indent
-    ///
-    /// `additional_indent` is counted in characters, not bytes.
     pub fn additional(&mut self, additional_indent: usize) -> &str {
-        let new_len = self.current_indent_len + additional_indent * self.indent_char.len_utf8();
+        let new_len = self.current_indent_len + additional_indent;
         self.ensure(new_len);
         &self.indents[..new_len]
     }

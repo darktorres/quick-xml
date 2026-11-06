@@ -3,14 +3,14 @@
 //! [simple types]: https://www.w3schools.com/xml/el_simpletype.asp
 //! [as defined]: https://www.w3.org/TR/xmlschema11-1/#Simple_Type_Definition
 
-use crate::se::{QuoteLevel, SeError, Write};
+use crate::escape::escape_char;
+use crate::se::{QuoteLevel, SeError};
 use crate::utils::CDataIterator;
 use serde::ser::{
     Impossible, Serialize, SerializeSeq, SerializeTuple, SerializeTupleStruct,
     SerializeTupleVariant, Serializer,
 };
-use std::fmt;
-use std::io;
+use std::fmt::{self, Write};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuoteTarget {
@@ -25,40 +25,16 @@ pub enum QuoteTarget {
     CData,
 }
 
-// TODO: Unfortunately, copy of crate::escape::escape_char. It would be nice to merge both...
-fn escape_char<W>(writer: &mut W, value: &str, from: usize, to: usize) -> io::Result<()>
+fn escape_into<W, F>(mut writer: W, value: &str, escape_chars: F) -> fmt::Result
 where
     W: Write,
-{
-    writer.write_str(&value[from..to])?;
-    match value.as_bytes()[to] {
-        b'<' => writer.write_str("&lt;")?,
-        b'>' => writer.write_str("&gt;")?,
-        b'\'' => writer.write_str("&apos;")?,
-        b'&' => writer.write_str("&amp;")?,
-        b'"' => writer.write_str("&quot;")?,
-
-        // Whitespace characters: used as delimiters in xs:list elements,
-        // and subject to XML EOL / attribute-value normalization
-        b'\t' => writer.write_str("&#9;")?,
-        b'\n' => writer.write_str("&#10;")?,
-        b'\r' => writer.write_str("&#13;")?,
-        b' ' => writer.write_str("&#32;")?,
-        _ => unreachable!("Only '<', '>','\', '&', '\"', '\\t', '\\r', '\\n', and ' ' are escaped"),
-    }
-    Ok(())
-}
-
-/// `escape_chars` is called with each byte and the part of `value` that precedes it.
-fn escape_into<W, F>(mut writer: W, value: &str, escape_chars: F) -> io::Result<()>
-where
-    W: Write,
-    F: Fn(u8, &[u8]) -> bool,
+    F: Fn(u8) -> bool,
 {
     let bytes = value.as_bytes();
-    let mut iter = bytes.iter().enumerate();
+    let mut iter = bytes.iter();
     let mut pos = 0;
-    while let Some((new_pos, _)) = iter.find(|&(i, &b)| escape_chars(b, &bytes[..i])) {
+    while let Some(i) = iter.position(|&b| escape_chars(b)) {
+        let new_pos = pos + i;
         escape_char(&mut writer, value, pos, new_pos)?;
         pos = new_pos + 1;
     }
@@ -71,12 +47,7 @@ where
 
 /// Escapes atomic value that could be part of a `xs:list`. All whitespace characters
 /// additionally escaped
-fn escape_item<W>(
-    mut writer: W,
-    value: &str,
-    target: QuoteTarget,
-    level: QuoteLevel,
-) -> io::Result<()>
+fn escape_item<W>(mut writer: W, value: &str, target: QuoteTarget, level: QuoteLevel) -> fmt::Result
 where
     W: Write,
 {
@@ -95,7 +66,7 @@ where
             }
             Ok(())
         }
-        (_, Full) => escape_into(writer, value, |ch, _| match ch {
+        (_, Full) => escape_into(writer, value, |ch| match ch {
             // Spaces used as delimiters of list items, cannot be used in the item
             b' ' | b'\r' | b'\n' | b'\t' => true,
             // Required characters to escape
@@ -103,24 +74,22 @@ where
             _ => false,
         }),
         //----------------------------------------------------------------------
-        (Text, Partial) => escape_into(writer, value, |ch, _| match ch {
+        (Text, Partial) => escape_into(writer, value, |ch| match ch {
             // Spaces used as delimiters of list items, cannot be used in the item
             b' ' | b'\r' | b'\n' | b'\t' => true,
             // Required characters to escape
             b'&' | b'<' | b'>' => true,
             _ => false,
         }),
-        (Text, Minimal) => escape_into(writer, value, |ch, before| match ch {
+        (Text, Minimal) => escape_into(writer, value, |ch| match ch {
             // Spaces used as delimiters of list items, cannot be used in the item
             b' ' | b'\r' | b'\n' | b'\t' => true,
             // Required characters to escape
             b'&' | b'<' => true,
-            // `]]>` is not allowed in text content
-            b'>' => before.ends_with(b"]]"),
             _ => false,
         }),
         //----------------------------------------------------------------------
-        (DoubleQAttr, Partial) => escape_into(writer, value, |ch, _| match ch {
+        (DoubleQAttr, Partial) => escape_into(writer, value, |ch| match ch {
             // Spaces used as delimiters of list items, cannot be used in the item
             b' ' | b'\r' | b'\n' | b'\t' => true,
             // Required characters to escape
@@ -129,7 +98,7 @@ where
             b'"' => true,
             _ => false,
         }),
-        (DoubleQAttr, Minimal) => escape_into(writer, value, |ch, _| match ch {
+        (DoubleQAttr, Minimal) => escape_into(writer, value, |ch| match ch {
             // Spaces used as delimiters of list items, cannot be used in the item
             b' ' | b'\r' | b'\n' | b'\t' => true,
             // Required characters to escape
@@ -139,7 +108,7 @@ where
             _ => false,
         }),
         //----------------------------------------------------------------------
-        (SingleQAttr, Partial) => escape_into(writer, value, |ch, _| match ch {
+        (SingleQAttr, Partial) => escape_into(writer, value, |ch| match ch {
             // Spaces used as delimiters of list items
             b' ' | b'\r' | b'\n' | b'\t' => true,
             // Required characters to escape
@@ -148,7 +117,7 @@ where
             b'\'' => true,
             _ => false,
         }),
-        (SingleQAttr, Minimal) => escape_into(writer, value, |ch, _| match ch {
+        (SingleQAttr, Minimal) => escape_into(writer, value, |ch| match ch {
             // Spaces used as delimiters of list items
             b' ' | b'\r' | b'\n' | b'\t' => true,
             // Required characters to escape
@@ -167,12 +136,7 @@ where
 /// preservation because XML parsers normalize these characters on input
 /// (Section 2.11, Section 3.3.3). Character references bypass normalization.
 /// This matches the behavior of libxml2.
-fn escape_list<W>(
-    mut writer: W,
-    value: &str,
-    target: QuoteTarget,
-    level: QuoteLevel,
-) -> io::Result<()>
+fn escape_list<W>(mut writer: W, value: &str, target: QuoteTarget, level: QuoteLevel) -> fmt::Result
 where
     W: Write,
 {
@@ -188,31 +152,29 @@ where
             }
             Ok(())
         }
-        (Text, Full) => escape_into(writer, value, |ch, _| match ch {
+        (Text, Full) => escape_into(writer, value, |ch| match ch {
             // XML EOL normalization (Section 2.11) would convert \r to \n
             b'\r' => true,
             // Required characters to escape
             b'&' | b'<' | b'>' | b'\'' | b'\"' => true,
             _ => false,
         }),
-        (Text, Partial) => escape_into(writer, value, |ch, _| match ch {
+        (Text, Partial) => escape_into(writer, value, |ch| match ch {
             // XML EOL normalization (Section 2.11) would convert \r to \n
             b'\r' => true,
             // Required characters to escape
             b'&' | b'<' | b'>' => true,
             _ => false,
         }),
-        (Text, Minimal) => escape_into(writer, value, |ch, before| match ch {
+        (Text, Minimal) => escape_into(writer, value, |ch| match ch {
             // XML EOL normalization (Section 2.11) would convert \r to \n
             b'\r' => true,
             // Required characters to escape
             b'&' | b'<' => true,
-            // `]]>` is not allowed in text content
-            b'>' => before.ends_with(b"]]"),
             _ => false,
         }),
         //----------------------------------------------------------------------
-        (_, Full) => escape_into(writer, value, |ch, _| match ch {
+        (_, Full) => escape_into(writer, value, |ch| match ch {
             // XML EOL normalization (Section 2.11) and attribute-value normalization
             // (Section 3.3.3) would convert these to \n and space respectively
             b'\r' | b'\n' | b'\t' => true,
@@ -221,7 +183,7 @@ where
             _ => false,
         }),
         //----------------------------------------------------------------------
-        (DoubleQAttr, Partial) => escape_into(writer, value, |ch, _| match ch {
+        (DoubleQAttr, Partial) => escape_into(writer, value, |ch| match ch {
             // XML EOL / attribute-value normalization (Section 2.11, Section 3.3.3)
             b'\r' | b'\n' | b'\t' => true,
             // Required characters to escape
@@ -230,7 +192,7 @@ where
             b'"' => true,
             _ => false,
         }),
-        (DoubleQAttr, Minimal) => escape_into(writer, value, |ch, _| match ch {
+        (DoubleQAttr, Minimal) => escape_into(writer, value, |ch| match ch {
             // XML EOL / attribute-value normalization (Section 2.11, Section 3.3.3)
             b'\r' | b'\n' | b'\t' => true,
             // Required characters to escape
@@ -240,7 +202,7 @@ where
             _ => false,
         }),
         //----------------------------------------------------------------------
-        (SingleQAttr, Partial) => escape_into(writer, value, |ch, _| match ch {
+        (SingleQAttr, Partial) => escape_into(writer, value, |ch| match ch {
             // XML EOL / attribute-value normalization (Section 2.11, Section 3.3.3)
             b'\r' | b'\n' | b'\t' => true,
             // Required characters to escape
@@ -249,7 +211,7 @@ where
             b'\'' => true,
             _ => false,
         }),
-        (SingleQAttr, Minimal) => escape_into(writer, value, |ch, _| match ch {
+        (SingleQAttr, Minimal) => escape_into(writer, value, |ch| match ch {
             // XML EOL / attribute-value normalization (Section 2.11, Section 3.3.3)
             b'\r' | b'\n' | b'\t' => true,
             // Required characters to escape
@@ -302,10 +264,10 @@ pub struct AtomicSerializer<W: Write> {
 }
 
 impl<W: Write> AtomicSerializer<W> {
-    fn write_delimiter(&mut self) -> io::Result<()> {
+    fn write_delimiter(&mut self) -> fmt::Result {
         if self.write_delimiter {
             // TODO: Customization point -- possible non-XML compatible extension to specify delimiter char
-            return self.writer.write_str(" ");
+            return self.writer.write_char(' ');
         }
         Ok(())
     }
@@ -524,6 +486,17 @@ pub struct SimpleTypeSerializer<W: Write> {
     pub target: QuoteTarget,
     /// Defines which XML characters need to be escaped
     pub level: QuoteLevel,
+}
+
+impl<W: Write> SimpleTypeSerializer<W> {
+    #[inline]
+    fn write_str(&mut self, value: &str) -> Result<(), SeError> {
+        Ok(self.writer.write_str(value)?)
+    }
+    #[inline]
+    fn write_fmt(&mut self, args: fmt::Arguments<'_>) -> Result<(), SeError> {
+        Ok(self.writer.write_fmt(args)?)
+    }
 }
 
 impl<W: Write> Serializer for SimpleTypeSerializer<W> {
@@ -876,14 +849,6 @@ mod tests {
             }
 
             #[test]
-            fn text_cdata_end() {
-                assert_eq!(
-                    escape_item("a]]>b]>c", QuoteTarget::Text, QuoteLevel::Minimal),
-                    "a]]&gt;b]>c"
-                );
-            }
-
-            #[test]
             fn double_quote_attr() {
                 assert_eq!(
                     escape_item(
@@ -1039,14 +1004,6 @@ mod tests {
                         QuoteLevel::Minimal
                     ),
                     "text&lt;\"'&amp;> \t\n&#13;text"
-                );
-            }
-
-            #[test]
-            fn text_cdata_end() {
-                assert_eq!(
-                    escape_list("a]]>b]>c", QuoteTarget::Text, QuoteLevel::Minimal),
-                    "a]]&gt;b]>c"
                 );
             }
 

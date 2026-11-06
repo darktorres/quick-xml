@@ -5,9 +5,7 @@ use std::fmt::Debug;
 use encoding_rs::UTF_8;
 
 use crate::errors::{Error, IllFormedError, Result};
-use crate::events::{
-    BytesCData, BytesComment, BytesDecl, BytesEnd, BytesPI, BytesStart, BytesText, Event,
-};
+use crate::events::{BytesCData, BytesDecl, BytesEnd, BytesPI, BytesStart, BytesText, Event};
 use crate::parser::{Parser, PiParser};
 #[cfg(feature = "encoding")]
 use crate::reader::EncodingRef;
@@ -138,7 +136,7 @@ impl ReaderState {
                         haystack = &haystack[p + 1..];
                     }
                 }
-                Ok(Event::Comment(BytesComment::wrap(
+                Ok(Event::Comment(BytesText::wrap(
                     // Cut of `<!--` and `-->` from start and end
                     &buf[4..len - 3],
                 )))
@@ -364,6 +362,19 @@ impl ReaderState {
             .opened_buffer
             .split_off(self.opened_starts.pop().unwrap());
         BytesEnd::wrap(Cow::Owned(name))
+    }
+}
+
+// photo-gallery: a state in buffers kept from an earlier reader (`NsReader::from_str_with`), emptied first.
+impl ReaderState {
+    pub(super) fn with_buffers(mut opened_buffer: String, mut opened_starts: Vec<usize>) -> Self {
+        opened_buffer.clear();
+        opened_starts.clear();
+        Self { opened_buffer, opened_starts, ..Self::default() }
+    }
+
+    pub(super) fn into_buffers(self) -> (String, Vec<usize>) {
+        (self.opened_buffer, self.opened_starts)
     }
 }
 

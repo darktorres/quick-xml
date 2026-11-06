@@ -18,10 +18,7 @@ pub enum ParseCharRefError {
     InvalidCodepoint(u32),
     /// Character reference expanded to a not permitted character for an XML.
     ///
-    /// Currently, only `0x0`, `0xFFFE` and `0xFFFF` characters produce this error.
-    /// They are excluded from the [`Char`] production in both XML 1.0 and XML 1.1.
-    ///
-    /// [`Char`]: https://www.w3.org/TR/xml11/#NT-Char
+    /// Currently, only `0x0` character produces this error.
     IllegalCharacter(u32),
 }
 
@@ -30,8 +27,8 @@ impl std::fmt::Display for ParseCharRefError {
         match self {
             Self::UnexpectedSign => f.write_str("unexpected number sign"),
             Self::InvalidNumber(e) => e.fmt(f),
-            Self::InvalidCodepoint(n) => write!(f, "0x{:X} is not a valid codepoint", n),
-            Self::IllegalCharacter(n) => write!(f, "0x{:X} character is not permitted in XML", n),
+            Self::InvalidCodepoint(n) => write!(f, "`{}` is not a valid codepoint", n),
+            Self::IllegalCharacter(n) => write!(f, "0x{:x} character is not permitted in XML", n),
         }
     }
 }
@@ -39,7 +36,7 @@ impl std::fmt::Display for ParseCharRefError {
 impl std::error::Error for ParseCharRefError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::InvalidNumber(e) => e.source(),
+            Self::InvalidNumber(e) => Some(e),
             _ => None,
         }
     }
@@ -71,10 +68,12 @@ impl std::fmt::Display for EscapeError {
             }
             Self::UnterminatedEntity(e) => write!(
                 f,
-                "at {:?}: entity or character reference not closed: `;` not found after `&`",
+                "Error while escaping character at range {:?}: Cannot find ';' after '&'",
                 e
             ),
-            Self::InvalidCharRef(_) => f.write_str("invalid character reference"),
+            Self::InvalidCharRef(e) => {
+                write!(f, "invalid character reference: {}", e)
+            }
             Self::TooManyNestedEntities => {
                 f.write_str("too many nested entities in an attribute value")
             }
@@ -106,7 +105,7 @@ impl std::error::Error for EscapeError {
 /// | `"`       | `&quot;`
 /// | `\r`      | `&#13;`
 pub fn escape<'a>(raw: impl Into<Cow<'a, str>>) -> Cow<'a, str> {
-    _escape(raw, |ch, _| {
+    _escape(raw, |ch| {
         matches!(ch, b'<' | b'>' | b'&' | b'\'' | b'\"' | b'\r')
     })
 }
@@ -127,33 +126,26 @@ pub fn escape<'a>(raw: impl Into<Cow<'a, str>>) -> Cow<'a, str> {
 /// | `&`       | `&amp;`
 /// | `\r`      | `&#13;`
 pub fn partial_escape<'a>(raw: impl Into<Cow<'a, str>>) -> Cow<'a, str> {
-    _escape(raw, |ch, _| matches!(ch, b'<' | b'>' | b'&' | b'\r'))
+    _escape(raw, |ch| matches!(ch, b'<' | b'>' | b'&' | b'\r'))
 }
 
 /// XML standard [requires] that only `<` and `&` was escaped in text content or
-/// attribute value, and that `>` was escaped when it appears in the string `]]>`
-/// in text content. All other characters not necessary to be escaped, although
+/// attribute value. All other characters not necessary to be escaped, although
 /// for compatibility with SGML they also should be escaped. Practically, escaping
 /// only those characters is enough. Also escapes `\r` which would otherwise be
 /// converted to `\n` by XML end-of-line normalization.
 ///
 /// This function performs following replacements:
 ///
-/// | Character        | Replacement
-/// |------------------|------------
-/// | `<`              | `&lt;`
-/// | `>` after `]]`   | `&gt;`
-/// | `&`              | `&amp;`
-/// | `\r`             | `&#13;`
+/// | Character | Replacement
+/// |-----------|------------
+/// | `<`       | `&lt;`
+/// | `&`       | `&amp;`
+/// | `\r`      | `&#13;`
 ///
 /// [requires]: https://www.w3.org/TR/xml11/#syntax
 pub fn minimal_escape<'a>(raw: impl Into<Cow<'a, str>>) -> Cow<'a, str> {
-    _escape(raw, |ch, before| match ch {
-        b'<' | b'&' | b'\r' => true,
-        // `]]>` is not allowed in text content
-        b'>' => before.ends_with(b"]]"),
-        _ => false,
-    })
+    _escape(raw, |ch| matches!(ch, b'<' | b'&' | b'\r'))
 }
 
 /// Escapes a `&str` for use in an XML attribute value. In addition to the
@@ -173,7 +165,7 @@ pub fn minimal_escape<'a>(raw: impl Into<Cow<'a, str>>) -> Cow<'a, str> {
 /// | `\n`      | `&#10;`
 /// | `\t`      | `&#9;`
 pub(crate) fn escape_attribute<'a>(raw: impl Into<Cow<'a, str>>) -> Cow<'a, str> {
-    _escape(raw, |ch, _| {
+    _escape(raw, |ch| {
         matches!(
             ch,
             b'<' | b'>' | b'&' | b'\'' | b'\"' | b'\r' | b'\n' | b'\t'
@@ -206,22 +198,18 @@ where
 
 /// Escapes an `&str` and replaces a subset of xml special characters (`<`, `>`,
 /// `&`, `'`, `"`) with their corresponding xml escaped value.
-///
-/// `escape_chars` is called with each byte and the part of `raw` that precedes it.
-fn _escape<'a, F: Fn(u8, &[u8]) -> bool>(
-    raw: impl Into<Cow<'a, str>>,
-    escape_chars: F,
-) -> Cow<'a, str> {
+fn _escape<'a, F: Fn(u8) -> bool>(raw: impl Into<Cow<'a, str>>, escape_chars: F) -> Cow<'a, str> {
     let raw = raw.into();
     let bytes = raw.as_bytes();
     let mut escaped = None;
-    let mut iter = bytes.iter().enumerate();
+    let mut iter = bytes.iter();
     let mut pos = 0;
-    while let Some((new_pos, _)) = iter.find(|&(i, &b)| escape_chars(b, &bytes[..i])) {
+    while let Some(i) = iter.position(|&b| escape_chars(b)) {
         if escaped.is_none() {
             escaped = Some(String::with_capacity(raw.len()));
         }
         let escaped = escaped.as_mut().expect("initialized");
+        let new_pos = pos + i;
         // SAFETY: It should fail only on OOM
         escape_char(escaped, &raw, pos, new_pos).unwrap();
         pos = new_pos + 1;
@@ -2378,7 +2366,7 @@ pub(crate) fn parse_number(num: &str) -> Result<char, ParseCharRefError> {
     } else {
         from_str_radix(num, 10)?
     };
-    if matches!(code, 0 | 0xFFFE | 0xFFFF) {
+    if code == 0 {
         return Err(ParseCharRefError::IllegalCharacter(code));
     }
     match std::char::from_u32(code) {

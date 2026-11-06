@@ -14,6 +14,16 @@ use crate::events::{BytesText, Event};
 use crate::name::{NamespaceResolver, QName, ResolveResult};
 use crate::reader::{Config, Reader, Span, XmlSource};
 
+/// photo-gallery: what a reader allocates as it reads (the open elements' names, the namespace bindings in scope),
+/// kept from one reader to the next: [`NsReader::from_str_with`], [`NsReader::into_buffers`].
+#[derive(Debug, Default)]
+pub struct ReaderBuffers {
+    opened_buffer: String,
+    opened_starts: Vec<usize>,
+    ns_buffer: String,
+    ns_bindings: Vec<crate::name::NamespaceBinding>,
+}
+
 /// A low level encoding-agnostic XML event reader that performs namespace resolution.
 ///
 /// Consumes a [`BufRead`] and streams XML `Event`s.
@@ -460,6 +470,32 @@ impl<'i> NsReader<&'i [u8]> {
         Self::new(Reader::from_str(s))
     }
 
+    /// photo-gallery: [`Self::from_str`] in the buffers an earlier reader gave back ([`Self::into_buffers`]), so
+    /// that reading one document after another allocates only when one needs more than any before it. It reads
+    /// exactly as [`Self::from_str`] does.
+    pub fn from_str_with(s: &'i str, buffers: ReaderBuffers) -> Self {
+        let ReaderBuffers { opened_buffer, opened_starts, ns_buffer, ns_bindings } = buffers;
+        #[cfg_attr(not(feature = "encoding"), allow(unused_mut))]
+        let mut reader = Reader::from_reader_with(s.as_bytes(), opened_buffer, opened_starts);
+        // As `Reader::from_str`: Rust strings are UTF-8.
+        #[cfg(feature = "encoding")]
+        {
+            reader.state.encoding = crate::reader::EncodingRef::Explicit(encoding_rs::UTF_8);
+        }
+        Self {
+            reader,
+            ns_resolver: NamespaceResolver::with_buffers(ns_buffer, ns_bindings),
+            pending_pop: false,
+        }
+    }
+
+    /// photo-gallery: this reader's buffers, for the next one ([`Self::from_str_with`]).
+    pub fn into_buffers(self) -> ReaderBuffers {
+        let (opened_buffer, opened_starts) = self.reader.into_buffers();
+        let (ns_buffer, ns_bindings) = self.ns_resolver.into_buffers();
+        ReaderBuffers { opened_buffer, opened_starts, ns_buffer, ns_bindings }
+    }
+
     /// Reads the next event, borrow its content from the input buffer.
     ///
     /// This method manages namespaces but doesn't resolve them automatically.
@@ -766,5 +802,72 @@ impl<R> Deref for NsReader<R> {
     #[inline]
     fn deref(&self) -> &Self::Target {
         &self.reader
+    }
+}
+
+// photo-gallery: readers in kept buffers read as new ones, document after document; and the duplicate-attribute
+// check on both sides of its inline keys.
+#[cfg(test)]
+mod photo_gallery {
+    use super::*;
+    use crate::events::attributes::AttrError;
+
+    fn events(r: &mut NsReader<&[u8]>) -> Vec<String> {
+        let mut out = Vec::new();
+        loop {
+            match r.read_resolved_event() {
+                Ok((_, Event::Eof)) => return out,
+                Ok((ns, e)) => out.push(format!("{ns:?} {e:?}")),
+                Err(e) => {
+                    out.push(format!("error {e}"));
+                    return out;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_reader_in_kept_buffers_reads_as_a_new_one() {
+        let docs = [
+            r#"<a xmlns="urn:a" xmlns:b="urn:b"><b:c x="1" b:y="2">t</b:c><d/></a>"#,
+            "<x:y xmlns:x='urn:x'><z xmlns:x='urn:other'><x:w/></z></x:y>",
+            "<unclosed><x>",
+            "<p xmlns:q='urn:q'><q:r/></p></extra>",
+            "",
+        ];
+        let mut buffers = ReaderBuffers::default();
+        for _ in 0..3 {
+            for doc in docs {
+                let want = events(&mut NsReader::from_str(doc));
+                let mut kept = NsReader::from_str_with(doc, std::mem::take(&mut buffers));
+                assert_eq!(events(&mut kept), want, "{doc}");
+                buffers = kept.into_buffers();
+            }
+        }
+    }
+
+    #[test]
+    fn duplicates_are_found_past_the_inline_keys() {
+        for n in 1..=40 {
+            for dup in 0..n {
+                let mut tag = String::from("<t");
+                let mut starts = Vec::new();
+                for i in 0..n {
+                    starts.push(tag.len() + 1);
+                    tag += &format!(" a{i}='v'");
+                }
+                let at = tag.len() + 1;
+                tag += &format!(" a{dup}='w'/>");
+                let mut reader = NsReader::from_str(&tag);
+                let Ok(Event::Empty(e)) = reader.read_event() else { panic!("{tag}") };
+                let mut attrs = e.attributes();
+                for _ in 0..n {
+                    assert!(attrs.next().unwrap().is_ok());
+                }
+                // Offsets are from the tag's name (after `<`).
+                let err = attrs.next().unwrap().unwrap_err();
+                assert_eq!(err, AttrError::Duplicated(at - 1, starts[dup] - 1), "{n} attributes, a{dup} again");
+            }
+        }
     }
 }

@@ -5,11 +5,12 @@ use crate::se::content::ContentSerializer;
 use crate::se::key::QNameSerializer;
 use crate::se::simple_type::{QuoteTarget, SimpleSeq, SimpleTypeSerializer};
 use crate::se::text::TextSerializer;
-use crate::se::{EmptyElementHandling, SeError, Write, WriteResult, XmlName};
+use crate::se::{EmptyElementHandling, SeError, WriteResult, XmlName};
 use serde::ser::{
     Impossible, Serialize, SerializeMap, SerializeSeq, SerializeStruct, SerializeStructVariant,
     SerializeTuple, SerializeTupleStruct, SerializeTupleVariant, Serializer,
 };
+use std::fmt::Write;
 
 /// Writes simple type content between [`ElementSerializer::key`] tags.
 macro_rules! write_primitive {
@@ -232,7 +233,7 @@ impl<'w, 'k, W: Write> Serializer for ElementSerializer<'w, 'k, W> {
         self.ser.write_indent()?;
         self.ser.indent.increase();
 
-        self.ser.writer.write_str("<")?;
+        self.ser.writer.write_char('<')?;
         self.ser.writer.write_str(self.key.0)?;
         Ok(Struct {
             ser: self,
@@ -402,18 +403,18 @@ impl<'w, 'k, W: Write> Struct<'w, 'k, W> {
         T: ?Sized + Serialize,
     {
         //TODO: Customization point: each attribute on new line
-        self.ser.ser.writer.write_str(" ")?;
+        self.ser.ser.writer.write_char(' ')?;
         self.ser.ser.writer.write_str(key.0)?;
-        self.ser.ser.writer.write_str("=")?;
+        self.ser.ser.writer.write_char('=')?;
 
         //TODO: Customization point: preferred quote style
-        self.ser.ser.writer.write_str("\"")?;
+        self.ser.ser.writer.write_char('"')?;
         value.serialize(SimpleTypeSerializer {
             writer: &mut self.ser.ser.writer,
             target: QuoteTarget::DoubleQAttr,
             level: self.ser.ser.level,
         })?;
-        self.ser.ser.writer.write_str("\"")?;
+        self.ser.ser.writer.write_char('"')?;
 
         Ok(())
     }
@@ -488,11 +489,11 @@ impl<'w, 'k, W: Write> SerializeStruct for Struct<'w, 'k, W> {
                 EmptyElementHandling::Expanded => {
                     self.ser.ser.writer.write_str("></")?;
                     self.ser.ser.writer.write_str(self.ser.key.0)?;
-                    self.ser.ser.writer.write_str(">")?;
+                    self.ser.ser.writer.write_char('>')?;
                 }
             }
         } else {
-            self.ser.ser.writer.write_str(">")?;
+            self.ser.ser.writer.write_char('>')?;
             self.ser.ser.writer.write_str(&self.children)?;
 
             if self.write_indent {
@@ -501,7 +502,7 @@ impl<'w, 'k, W: Write> SerializeStruct for Struct<'w, 'k, W> {
 
             self.ser.ser.writer.write_str("</")?;
             self.ser.ser.writer.write_str(self.ser.key.0)?;
-            self.ser.ser.writer.write_str(">")?;
+            self.ser.ser.writer.write_char('>')?;
         }
         Ok(WriteResult::Element)
     }
@@ -1349,7 +1350,7 @@ mod tests {
                         ser: ContentSerializer {
                             writer: &mut buffer,
                             level: QuoteLevel::Full,
-                            indent: Indent::Owned(Indentation::new(' ', 2)),
+                            indent: Indent::Owned(Indentation::new(b' ', 2)),
                             write_indent: false,
                             text_format: TextFormat::Text,
                             allow_primitive: true,
@@ -1376,7 +1377,7 @@ mod tests {
                         ser: ContentSerializer {
                             writer: &mut buffer,
                             level: QuoteLevel::Full,
-                            indent: Indent::Owned(Indentation::new(' ', 2)),
+                            indent: Indent::Owned(Indentation::new(b' ', 2)),
                             write_indent: false,
                             text_format: TextFormat::Text,
                             allow_primitive: true,

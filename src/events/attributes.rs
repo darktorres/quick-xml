@@ -913,6 +913,47 @@ fn hash_name(name: &[u8]) -> u64 {
     hasher.finish()
 }
 
+/// photo-gallery: the attribute names seen so far, the first `SMALL_ATTRIBUTE_COUNT` inline, the rest in a `Vec`:
+/// a tag with at most that many attributes is checked for duplicates without allocating (upstream pushed every
+/// name into a `Vec`, one allocation per tag with attributes, more as it grew).
+#[derive(Clone, Debug)]
+struct Keys {
+    inline: [(usize, usize); SMALL_ATTRIBUTE_COUNT],
+    len: usize,
+    more: Vec<Range<usize>>,
+}
+
+impl Keys {
+    const fn new() -> Self {
+        Keys {
+            inline: [(0, 0); SMALL_ATTRIBUTE_COUNT],
+            len: 0,
+            more: Vec::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.len + self.more.len()
+    }
+
+    fn push(&mut self, key: Range<usize>) {
+        if self.len < SMALL_ATTRIBUTE_COUNT {
+            self.inline[self.len] = (key.start, key.end);
+            self.len += 1;
+        } else {
+            self.more.push(key);
+        }
+    }
+
+    /// In the order pushed.
+    fn iter(&self) -> impl Iterator<Item = Range<usize>> + '_ {
+        self.inline[..self.len]
+            .iter()
+            .map(|&(start, end)| start..end)
+            .chain(self.more.iter().cloned())
+    }
+}
+
 /// External iterator over spans of attribute key and value
 #[derive(Clone, Debug)]
 pub(crate) struct IterState {
@@ -927,7 +968,7 @@ pub(crate) struct IterState {
     /// If `check_duplicates` is set, contains the ranges of already parsed attribute
     /// names. We store a ranges instead of slices to able to report a previous
     /// attribute position
-    keys: Vec<Range<usize>>,
+    keys: Keys,
     /// 64-bit hashes of the byte content of `keys`, used as an O(1) pre-filter
     /// once a start tag declares more than `SMALL_ATTRIBUTE_COUNT` attributes, so
     /// the duplicate check stays O(N) over the whole tag instead of O(N²). The
@@ -943,7 +984,7 @@ impl IterState {
             state: State::Next(offset),
             html,
             check_duplicates: true,
-            keys: Vec::new(),
+            keys: Keys::new(),
             key_hashes: None,
         }
     }
@@ -1045,7 +1086,7 @@ impl IterState {
             if let Some(prev) = self
                 .keys
                 .iter()
-                .find(|r| slice[(*r).clone()] == slice[key.clone()])
+                .find(|r| slice[r.clone()] == slice[key.clone()])
             {
                 return Err(AttrError::Duplicated(key.start, prev.start));
             }
@@ -1071,8 +1112,8 @@ impl IterState {
                 keys.len() * 2,
                 BuildHasherDefault::<IdentityHasher>::default(),
             );
-            for r in keys {
-                set.insert(hash_name(&slice[r.clone()]));
+            for r in keys.iter() {
+                set.insert(hash_name(&slice[r]));
             }
             set
         });
@@ -1083,7 +1124,7 @@ impl IterState {
             if let Some(prev) = self
                 .keys
                 .iter()
-                .find(|r| slice[(*r).clone()] == slice[key.clone()])
+                .find(|r| slice[r.clone()] == slice[key.clone()])
             {
                 return Err(AttrError::Duplicated(key.start, prev.start));
             }
